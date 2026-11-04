@@ -1,6 +1,8 @@
 using Microsoft.Data.Sqlite;
 using System.Diagnostics;
 using System.Security.Cryptography;
+using System.Runtime.InteropServices;
+using System.Text;
 
 namespace SSDRescue;
 
@@ -9,7 +11,7 @@ public sealed class MainForm : Form
     readonly TextBox sourceBox = new() { Dock = DockStyle.Fill };
     readonly TextBox targetBox = new() { Dock = DockStyle.Fill };
     readonly Button startButton = new() { Text = "开始 / 继续", AutoSize = true };
-    readonly Button pauseButton = new() { Text = "暂停", AutoSize = true };
+    readonly Button pauseButton = new() { Text = "暂停", AutoSize = true, Enabled = false };
     readonly Button rescanButton = new() { Text = "重新扫描磁盘", AutoSize = true };
     readonly Label status = new() { Text = "未开始", AutoSize = true };
     readonly Label counters = new() { Text = "", AutoSize = true };
@@ -18,6 +20,7 @@ public sealed class MainForm : Form
     CancellationTokenSource? cts;
     readonly JobDb db;
     string? jobId;
+    bool closing;
 
     public MainForm()
     {
@@ -26,7 +29,12 @@ public sealed class MainForm : Form
         Height = 620;
         MinimumSize = new Size(760, 520);
 
-        db = new JobDb(Path.Combine(AppContext.BaseDirectory, "jobs.db"));
+        string dataDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "SSDRescue");
+        Directory.CreateDirectory(dataDir);
+        db = new JobDb(Path.Combine(dataDir, "jobs.db"));
+
         var saved = db.GetLastJob();
         if (saved.HasValue)
         {
@@ -79,8 +87,34 @@ public sealed class MainForm : Form
         root.SetColumnSpan(logBox, 2);
         Controls.Add(root);
 
-        FormClosing += (_, _) => cts?.Cancel();
+        FormClosing += MainForm_FormClosing;
         UpdateCounters();
+    }
+
+    void MainForm_FormClosing(object? sender, FormClosingEventArgs e)
+    {
+        if (cts is null)
+            return;
+
+        // The copy operation is cancellation-aware and checkpoints after each
+        // flushed chunk. Give it a chance to close its handles before exit.
+        closing = true;
+        cts.Cancel();
+        e.Cancel = true;
+        status.Text = "正在安全停止，请稍候……";
+        pauseButton.Enabled = false;
+        startButton.Enabled = false;
+
+        _ = WaitForCloseAsync();
+    }
+
+    async Task WaitForCloseAsync()
+    {
+        while (cts is not null)
+            await Task.Delay(50);
+
+        if (!IsDisposed)
+            BeginInvoke(Close);
     }
 
     void Pick(TextBox box)
@@ -101,8 +135,8 @@ public sealed class MainForm : Form
         string dst;
         try
         {
-            src = Path.GetFullPath(sourceBox.Text.Trim());
-            dst = Path.GetFullPath(targetBox.Text.Trim());
+            src = NormalizePath(Path.GetFullPath(sourceBox.Text.Trim()));
+            dst = NormalizePath(Path.GetFullPath(targetBox.Text.Trim()));
         }
         catch (Exception ex)
         {
@@ -112,21 +146,30 @@ public sealed class MainForm : Form
 
         if (!Directory.Exists(src))
         {
-            MessageBox.Show(this, "源目录不存在。");
+            MessageBox.Show(this, "源目录不存在。", "SSDRescue", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
-        if (string.Equals(NormalizePath(src), NormalizePath(dst), StringComparison.OrdinalIgnoreCase))
+        uint sourceSerial;
+        try
         {
-            MessageBox.Show(this, "源目录和目标目录不能相同。");
+            sourceSerial = VolumeIdentity.GetSerial(src);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(this, "无法读取源磁盘卷标识：" + ex.Message, "SSDRescue", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return;
         }
 
-        // The destination must not be inside the source. Otherwise the scan/copy
-        // could recursively copy the rescue output back into itself.
+        if (string.Equals(src, dst, StringComparison.OrdinalIgnoreCase))
+        {
+            MessageBox.Show(this, "源目录和目标目录不能相同。", "SSDRescue", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+
         if (IsSubdirectory(dst, src))
         {
-            MessageBox.Show(this, "为了防止递归复制，目标目录不能位于源目录内部。");
+            MessageBox.Show(this, "为了防止递归复制，目标目录不能位于源目录内部。", "SSDRescue", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             return;
         }
 
@@ -142,31 +185,71 @@ public sealed class MainForm : Form
         }
 
         jobId ??= Guid.NewGuid().ToString("N");
-        db.UpsertJob(jobId, src, dst);
 
-        if (db.FileCount(jobId) == 0)
+        // Once a job has a file list, its source/target are deliberately fixed.
+        // Changing them would make the existing relative-path database refer to
+        // a different disk and could cause an unsafe copy.
+        var existing = db.GetJob(jobId);
+        if (existing.HasValue && db.FileCount(jobId) > 0)
         {
-            Log("正在建立文件清单……");
-            try
+            if (!string.Equals(NormalizePath(existing.Value.Source), src, StringComparison.OrdinalIgnoreCase) ||
+                !string.Equals(NormalizePath(existing.Value.Target), dst, StringComparison.OrdinalIgnoreCase))
             {
-                await Task.Run(() => ScanFiles(jobId!, src));
+                MessageBox.Show(this,
+                    "这个任务已经建立文件清单，源目录和目标目录不能更改。\r\n\r\n" +
+                    "如果要处理另一组目录，请建立新的任务。当前版本为了数据安全不会自动迁移任务。",
+                    "SSDRescue", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
             }
-            catch (Exception ex)
+
+            if (existing.Value.SourceSerial != 0 && existing.Value.SourceSerial != sourceSerial)
             {
-                Log("建立文件清单失败：" + ex.Message);
+                MessageBox.Show(this,
+                    "源目录所在磁盘的卷标识已经变化。
+
+" +
+                    "为了防止掉盘后盘符被其他磁盘重新占用，程序不会继续复制。请确认原 SSD 已重新连接，并使用原来的卷。",
+                    "SSDRescue", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
         }
+        else
+        {
+            db.UpsertJob(jobId, src, dst, sourceSerial);
+        }
 
         cts = new CancellationTokenSource();
+        startButton.Enabled = false;
+        pauseButton.Enabled = true;
+
         try
         {
+            if (db.FileCount(jobId) == 0)
+            {
+                Log("正在建立文件清单……");
+                try
+                {
+                    await Task.Run(() => ScanFiles(jobId!, src, cts.Token), cts.Token);
+                }
+                catch (OperationCanceledException)
+                {
+                    status.Text = "已暂停";
+                    Log("建立文件清单已暂停。可以继续。" );
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Log("建立文件清单失败：" + ex.Message);
+                    return;
+                }
+            }
+
             await RunRoundsAsync(jobId!, src, dst, cts.Token);
         }
         catch (OperationCanceledException)
         {
             status.Text = "已暂停";
-            Log("已暂停。任务状态已保存，可继续。");
+            Log("已暂停。任务状态已保存，可继续。" );
         }
         catch (Exception ex)
         {
@@ -175,20 +258,25 @@ public sealed class MainForm : Form
         }
         finally
         {
-            cts.Dispose();
+            var old = cts;
             cts = null;
+            old?.Dispose();
+            pauseButton.Enabled = false;
+            startButton.Enabled = !closing;
             UpdateCounters();
         }
     }
 
-    void ScanFiles(string id, string src)
+    void ScanFiles(string id, string src, CancellationToken ct)
     {
         foreach (var f in Directory.EnumerateFiles(src, "*", SearchOption.AllDirectories))
         {
+            ct.ThrowIfCancellationRequested();
             try
             {
                 var fi = new FileInfo(f);
-                db.AddFile(id, Path.GetRelativePath(src, f), fi.Length, fi.LastWriteTimeUtc.Ticks);
+                if (fi.Exists)
+                    db.AddFile(id, Path.GetRelativePath(src, f), fi.Length, fi.LastWriteTimeUtc.Ticks);
             }
             catch (Exception ex)
             {
@@ -207,12 +295,13 @@ public sealed class MainForm : Form
             if (pending.Count == 0)
             {
                 status.Text = "完成";
-                Log("全部文件已完成并验证。");
+                Log("全部文件已完成并验证。" );
                 return;
             }
 
-            Log($"第 {round} 轮：待处理 {pending.Count} 个文件。");
+            Log($"第 {round} 轮：待处理 {pending.Count} 个文件。" );
             bool disconnected = false;
+            int completedThisRound = 0;
 
             foreach (var file in pending)
             {
@@ -226,23 +315,32 @@ public sealed class MainForm : Form
                     break;
                 }
 
+                if (result == CopyResult.Success)
+                    completedThisRound++;
+
                 UpdateCounters();
             }
 
             if (disconnected)
             {
                 status.Text = "源盘疑似掉盘，已暂停";
-                Log("检测到 I/O/设备异常，停止继续读取，避免反复轰击设备。请重新连接/重启后点击继续。");
+                Log("检测到 I/O/设备异常，停止继续读取，避免反复轰击设备。请重新连接/重启后点击继续。" );
                 return;
             }
 
-            // A short delay prevents a permanently failing file from being
-            // hammered continuously when an entire round makes no progress.
-            await Task.Delay(500, ct);
+            if (completedThisRound == 0 && pending.Count > 0)
+            {
+                Log("本轮没有新增成功文件；等待 2 秒后进入下一轮，避免连续高频重试。" );
+                await Task.Delay(2000, ct);
+            }
+            else
+            {
+                await Task.Delay(200, ct);
+            }
         }
 
         status.Text = "达到本次最大重试轮数";
-        Log("达到 1000 轮重试上限。未完成文件仍保留在数据库中，可再次点击继续。");
+        Log("达到 1000 轮重试上限。未完成文件仍保留在数据库中，可再次点击继续。" );
     }
 
     async Task<CopyResult> CopyOneAsync(string id, string src, string dst, JobFile f, CancellationToken ct)
@@ -275,45 +373,53 @@ public sealed class MainForm : Form
                 offset = 0;
             }
 
+            // If the database checkpoint is behind the actual .partial length,
+            // discard the uncheckpointed tail. This makes restart recovery safe.
+            offset = Math.Min(offset, Math.Max(0, f.CheckpointOffset));
+
             db.MarkCopying(f.Id, offset);
 
-            using var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.Read,
-                1024 * 1024, FileOptions.SequentialScan);
-            using var output = new FileStream(partial, FileMode.OpenOrCreate, FileAccess.Write, FileShare.Read,
-                1024 * 1024, FileOptions.SequentialScan);
-
-            input.Position = offset;
-            output.Position = offset;
-            output.SetLength(offset);
-
-            var buffer = new byte[4 * 1024 * 1024];
-            long done = offset;
-
-            while (done < f.Length)
+            // Important: these streams are scoped only to the actual copy.
+            // They MUST be disposed before hashing or renaming the .partial file.
+            using (var input = new FileStream(source, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete,
+                       1024 * 1024, FileOptions.SequentialScan))
+            using (var output = new FileStream(partial, FileMode.OpenOrCreate, FileAccess.Write, FileShare.None,
+                       1024 * 1024, FileOptions.SequentialScan))
             {
-                ct.ThrowIfCancellationRequested();
+                input.Position = offset;
+                output.Position = offset;
+                output.SetLength(offset);
 
-                int want = (int)Math.Min(buffer.Length, f.Length - done);
-                int n = await input.ReadAsync(buffer.AsMemory(0, want), ct);
-                if (n <= 0)
-                    throw new EndOfStreamException("源文件提前结束");
+                var buffer = new byte[4 * 1024 * 1024];
+                long done = offset;
 
-                await output.WriteAsync(buffer.AsMemory(0, n), ct);
-                await output.FlushAsync(ct);
+                while (done < f.Length)
+                {
+                    ct.ThrowIfCancellationRequested();
 
-                done += n;
-                db.Checkpoint(f.Id, done);
+                    int want = (int)Math.Min(buffer.Length, f.Length - done);
+                    int n = await input.ReadAsync(buffer.AsMemory(0, want), ct);
+                    if (n <= 0)
+                        throw new EndOfStreamException("源文件提前结束");
+
+                    await output.WriteAsync(buffer.AsMemory(0, n), ct);
+                    output.Flush(true);
+
+                    done += n;
+                    db.Checkpoint(f.Id, done);
+                }
             }
 
-            output.Flush(true);
-
-            string hash = await HashFileAsync(partial, ct);
+            // From this point onward the .partial file has no open handle from
+            // the copy phase. Hashing and Move are therefore safe on Windows.
+            ct.ThrowIfCancellationRequested();
+            string destinationHash = await HashFileAsync(partial, ct);
 
             var fi2 = new FileInfo(source);
             if (!fi2.Exists || fi2.Length != f.Length || fi2.LastWriteTimeUtc.Ticks != f.LastWriteTicks)
             {
-                db.Mark(f.Id, "SourceChanged", hash);
-                db.EndAttempt(attempt, "SourceChanged", hash, "复制后源文件大小或修改时间已改变");
+                db.Mark(f.Id, "SourceChanged", null);
+                db.EndAttempt(attempt, "SourceChanged", null, "复制后源文件大小或修改时间已改变");
                 TryDeletePartial(partial);
                 return CopyResult.Failed;
             }
@@ -321,16 +427,38 @@ public sealed class MainForm : Form
             if (new FileInfo(partial).Length != f.Length)
                 throw new IOException("目标长度校验失败");
 
-            // The destination is allowed to replace an old rescue result only
-            // after the new .partial file has passed SHA-256 verification.
+            // A second hash of the source makes the verification cryptographic:
+            // destinationHash must match the source bytes read after the copy.
+            string sourceHash = await HashFileAsync(source, ct);
+            if (!string.Equals(sourceHash, destinationHash, StringComparison.OrdinalIgnoreCase))
+            {
+                // A full .partial with a hash mismatch is not safe to resume.
+                // Discard it so the next attempt really rereads the source.
+                TryDeletePartial(partial);
+                db.ResetCheckpoint(f.Id);
+                throw new IOException($"SHA-256 校验失败：源={sourceHash} 目标={destinationHash}");
+            }
+
+            // The source metadata was checked again after the cryptographic read.
+            var fi3 = new FileInfo(source);
+            if (!fi3.Exists || fi3.Length != f.Length || fi3.LastWriteTimeUtc.Ticks != f.LastWriteTicks)
+            {
+                db.Mark(f.Id, "SourceChanged", null);
+                db.EndAttempt(attempt, "SourceChanged", null, "SHA-256 校验期间源文件发生变化");
+                TryDeletePartial(partial);
+                return CopyResult.Failed;
+            }
+
+            // The old destination is removed only after the new data has passed
+            // size + SHA-256 + source-stability checks.
             if (File.Exists(target))
                 File.Delete(target);
 
             File.Move(partial, target);
-            File.SetLastWriteTimeUtc(target, fi.LastWriteTimeUtc);
+            File.SetLastWriteTimeUtc(target, fi3.LastWriteTimeUtc);
 
-            db.Mark(f.Id, "Success", hash);
-            db.EndAttempt(attempt, "Success", hash, null);
+            db.Mark(f.Id, "Success", destinationHash);
+            db.EndAttempt(attempt, "Success", destinationHash, null);
             return CopyResult.Success;
         }
         catch (OperationCanceledException)
@@ -446,11 +574,35 @@ public sealed class MainForm : Form
     {
         if (InvokeRequired)
         {
-            BeginInvoke(() => Log(s));
+            if (!IsDisposed)
+                BeginInvoke(() => Log(s));
             return;
         }
 
         logBox.AppendText($"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {s}\r\n");
+    }
+}
+
+internal static class VolumeIdentity
+{
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern bool GetVolumeInformation(
+        string lpRootPathName,
+        StringBuilder? lpVolumeNameBuffer,
+        int nVolumeNameSize,
+        out uint lpVolumeSerialNumber,
+        out uint lpMaximumComponentLength,
+        out uint lpFileSystemFlags,
+        StringBuilder? lpFileSystemNameBuffer,
+        int nFileSystemNameSize);
+
+    public static uint GetSerial(string path)
+    {
+        string root = Path.GetPathRoot(Path.GetFullPath(path))
+            ?? throw new IOException("无法确定源目录所在磁盘");
+        if (!GetVolumeInformation(root, null, 0, out uint serial, out _, out _, null, 0))
+            throw new IOException($"GetVolumeInformation 失败，Win32 错误 {Marshal.GetLastWin32Error()}");
+        return serial;
     }
 }
 
@@ -461,7 +613,7 @@ public enum CopyResult
     Disconnected
 }
 
-public sealed record JobFile(long Id, string RelativePath, long Length, long LastWriteTicks);
+public sealed record JobFile(long Id, string RelativePath, long Length, long LastWriteTicks, long CheckpointOffset);
 
 public sealed class JobDb
 {
@@ -471,7 +623,9 @@ public sealed class JobDb
     {
         cs = new SqliteConnectionStringBuilder
         {
-            DataSource = path
+            DataSource = path,
+            Mode = SqliteOpenMode.ReadWriteCreate,
+            Cache = SqliteCacheMode.Default
         }.ToString();
 
         using var c = Open();
@@ -481,6 +635,7 @@ CREATE TABLE IF NOT EXISTS jobs(
     id TEXT PRIMARY KEY,
     source TEXT NOT NULL,
     target TEXT NOT NULL,
+    source_serial INTEGER NOT NULL DEFAULT 0,
     created TEXT NOT NULL,
     updated TEXT NOT NULL
 );
@@ -508,6 +663,42 @@ CREATE TABLE IF NOT EXISTS attempts(
 );
 ";
         cmd.ExecuteNonQuery();
+
+        // Safe schema upgrade for jobs created by the previous test build.
+        using (var checkColumn = c.CreateCommand())
+        {
+            checkColumn.CommandText = "PRAGMA table_info(jobs)";
+            bool hasSerial = false;
+            using var reader = checkColumn.ExecuteReader();
+            while (reader.Read())
+            {
+                if (string.Equals(reader.GetString(1), "source_serial", StringComparison.OrdinalIgnoreCase))
+                {
+                    hasSerial = true;
+                    break;
+                }
+            }
+
+            if (!hasSerial)
+            {
+                using var alterColumn = c.CreateCommand();
+                alterColumn.CommandText = "ALTER TABLE jobs ADD COLUMN source_serial INTEGER NOT NULL DEFAULT 0";
+                alterColumn.ExecuteNonQuery();
+            }
+        }
+
+        using var pragma = c.CreateCommand();
+        pragma.CommandText = "PRAGMA user_version";
+        int version = Convert.ToInt32(pragma.ExecuteScalar());
+        if (version < 1)
+        {
+            using var tx = c.BeginTransaction();
+            using var alter = c.CreateCommand();
+            alter.Transaction = tx;
+            alter.CommandText = "PRAGMA user_version = 1";
+            alter.ExecuteNonQuery();
+            tx.Commit();
+        }
     }
 
     SqliteConnection Open()
@@ -517,35 +708,49 @@ CREATE TABLE IF NOT EXISTS attempts(
         return c;
     }
 
-    public void UpsertJob(string id, string source, string target)
+    public void UpsertJob(string id, string source, string target, uint sourceSerial)
     {
         using var c = Open();
         using var cmd = c.CreateCommand();
         cmd.CommandText = @"
-INSERT INTO jobs(id,source,target,created,updated)
-VALUES($i,$s,$t,$n,$n)
+INSERT INTO jobs(id,source,target,source_serial,created,updated)
+VALUES($i,$s,$t,$v,$n,$n)
 ON CONFLICT(id) DO UPDATE SET
     source=$s,
     target=$t,
+    source_serial=$v,
     updated=$n";
         cmd.Parameters.AddWithValue("$i", id);
         cmd.Parameters.AddWithValue("$s", source);
         cmd.Parameters.AddWithValue("$t", target);
+        cmd.Parameters.AddWithValue("$v", sourceSerial);
         cmd.Parameters.AddWithValue("$n", DateTime.UtcNow.ToString("O"));
         cmd.ExecuteNonQuery();
     }
 
-    public (string Id, string Source, string Target)? GetLastJob()
+    public (string Id, string Source, string Target, uint SourceSerial)? GetLastJob()
     {
         using var c = Open();
         using var cmd = c.CreateCommand();
-        cmd.CommandText = "SELECT id,source,target FROM jobs ORDER BY updated DESC LIMIT 1";
+        cmd.CommandText = "SELECT id,source,target,source_serial FROM jobs ORDER BY updated DESC LIMIT 1";
         using var r = cmd.ExecuteReader();
 
         if (!r.Read())
             return null;
 
-        return (r.GetString(0), r.GetString(1), r.GetString(2));
+        return (r.GetString(0), r.GetString(1), r.GetString(2), Convert.ToUInt32(r.GetInt64(3)));
+    }
+
+    public (string Id, string Source, string Target, uint SourceSerial)? GetJob(string id)
+    {
+        using var c = Open();
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = "SELECT id,source,target,source_serial FROM jobs WHERE id=$i LIMIT 1";
+        cmd.Parameters.AddWithValue("$i", id);
+        using var r = cmd.ExecuteReader();
+        if (!r.Read())
+            return null;
+        return (r.GetString(0), r.GetString(1), r.GetString(2), Convert.ToUInt32(r.GetInt64(3)));
     }
 
     public int FileCount(string job)
@@ -578,7 +783,7 @@ VALUES($j,$r,$l,$t)";
         using var c = Open();
         using var cmd = c.CreateCommand();
         cmd.CommandText = @"
-SELECT id,rel,length,lastwrite
+SELECT id,rel,length,lastwrite,offset
 FROM files
 WHERE job_id=$j AND status NOT IN ('Success','SourceChanged')
 ORDER BY id";
@@ -586,7 +791,7 @@ ORDER BY id";
 
         using var r = cmd.ExecuteReader();
         while (r.Read())
-            a.Add(new JobFile(r.GetInt64(0), r.GetString(1), r.GetInt64(2), r.GetInt64(3)));
+            a.Add(new JobFile(r.GetInt64(0), r.GetString(1), r.GetInt64(2), r.GetInt64(3), r.GetInt64(4)));
 
         return a;
     }
@@ -617,7 +822,7 @@ ORDER BY id";
     {
         using var c = Open();
         using var cmd = c.CreateCommand();
-        cmd.CommandText = "UPDATE files SET offset=$o WHERE id=$i";
+        cmd.CommandText = "UPDATE files SET offset=$o,status='Copying' WHERE id=$i";
         cmd.Parameters.AddWithValue("$o", offset);
         cmd.Parameters.AddWithValue("$i", file);
         cmd.ExecuteNonQuery();
@@ -629,6 +834,15 @@ ORDER BY id";
         using var cmd = c.CreateCommand();
         cmd.CommandText = "UPDATE files SET status='Copying',offset=$o WHERE id=$i";
         cmd.Parameters.AddWithValue("$o", offset);
+        cmd.Parameters.AddWithValue("$i", file);
+        cmd.ExecuteNonQuery();
+    }
+
+    public void ResetCheckpoint(long file)
+    {
+        using var c = Open();
+        using var cmd = c.CreateCommand();
+        cmd.CommandText = "UPDATE files SET offset=0,status='Failed',sha256=NULL WHERE id=$i";
         cmd.Parameters.AddWithValue("$i", file);
         cmd.ExecuteNonQuery();
     }
