@@ -205,9 +205,7 @@ public sealed class MainForm : Form
             if (existing.Value.SourceSerial != 0 && existing.Value.SourceSerial != sourceSerial)
             {
                 MessageBox.Show(this,
-                    "源目录所在磁盘的卷标识已经变化。
-
-" +
+                    "源目录所在磁盘的卷标识已经变化。\r\n\r\n" +
                     "为了防止掉盘后盘符被其他磁盘重新占用，程序不会继续复制。请确认原 SSD 已重新连接，并使用原来的卷。",
                     "SSDRescue", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
